@@ -1,322 +1,139 @@
-# Plateforme ENT (Environnement Numérique de Travail)
+# Architecture Technique Détailée de la Plate-forme ENT
 
-## Description Générale
+## 1. Vue d'ensemble
 
-Cette plateforme est un Environnement Numérique de Travail (ENT) complet conçu avec une architecture microservices. Elle offre une suite d'outils et de services intégrés pour la gestion académique et la communication au sein d'un établissement d'enseignement.
+La plate-forme adopte un modèle **microservices** déployé via Docker Compose et orchestré par **Traefik**. Chaque domaine fonctionnel (authentification, gestion des cours, notes, messagerie, chatbot, etc.) est encapsulé dans un service isolé, communiquant principalement en **REST / JSON** et, pour l'asynchrone, via **RabbitMQ**.
 
-## Architecture Technique
+- Sécurité : Keycloak (OIDC) assure l'authentification et la délégation des rôles. Les services Python valident les JWT via un _Auth Service_ dédié.
+- Bases de données : Cassandra (données métier), Postgres (Keycloak), Qdrant (vecteurs IA), MinIO (objets), RabbitMQ (broker).
+- Observabilité : Prometheus scrape les métriques exposées par chaque service FastAPI ; Grafana propose des tableaux de bord prêts-à-l'emploi.
 
-### Vue d'ensemble de l'Architecture
+## 2. Microservices Backend
 
-```mermaid
-graph TB
-    Client[Client Web/Mobile]
-    Traefik[Traefik Reverse Proxy]
-    Keycloak[Keycloak Auth]
-    Auth[Auth Service]
-    Calendar[Calendar Service]
-    Chatbot[Chatbot Service]
-    Cours[Cours Service]
-    Files[Fichiers Service]
-    Message[Messagerie Service]
-    Notes[Notes Service]
-    Notif[Notification Service]
-    Support[Support Service]
-    User[User Service]
-    Cassandra[(Cassandra DB)]
-    Qdrant[(Qdrant Vector DB)]
-    MinIO[(MinIO Storage)]
-    RabbitMQ[(RabbitMQ)]
-    Prometheus[Prometheus]
-    Grafana[Grafana]
+| Service              | Port conteneur / Hôte | Stack                        | Rôle principal                       | Endpoints racine (Traefik) |
+| -------------------- | --------------------- | ---------------------------- | ------------------------------------ | -------------------------- |
+| auth-service         | 8000→8000             | FastAPI, PyJWT               | Validation des tokens, JWKS public   | `/api/auth`, `/test-jwks`  |
+| user-service         | 8001→8001             | FastAPI, Cassandra           | CRUD utilisateurs & rôles            | `/api/users`               |
+| service-cours        | 8002→8002             | FastAPI, Cassandra, MinIO    | Gestion & dépôt des cours            | `/api/cours`               |
+| service-fichiers     | 8003→8003             | FastAPI, MinIO               | Serveur de fichiers sécurisés        | `/api/fichiers`            |
+| notification-service | 8004→8004             | FastAPI, RabbitMQ, Cassandra | Push notifications (notes, support…) | `/api/notifications`       |
+| calendar-service     | 8004→8005 (host)      | FastAPI, Cassandra           | Calendrier académique                | `/api/calendar`            |
+| notes-service        | 8006→8006             | FastAPI, Cassandra           | Gestion des notes                    | `/api/notes`               |
+| support-service      | 8008→8008             | FastAPI, Cassandra, RabbitMQ | Tickets support & FAQ                | `/api/support`             |
+| chatbot-service      | 8082→8082             | FastAPI, Qdrant, Ollama      | IA conversationnelle, RAG            | `/chatbot`, `/docs`        |
+| massagerie-service   | 8010→8010             | FastAPI, Cassandra, RabbitMQ | Messagerie interne                   | `/api/messages`            |
+| calendar-service     | 8004→8005             | FastAPI, Cassandra           | Événements & emplois du temps        | `/api/calendar`            |
+| Traefik              | 80 / 443 / 8080       | Go                           | API Gateway & TLS termination        | `/dashboard`               |
+| RabbitMQ             | 5672 / 15672          | Erlang                       | Broker AMQP ; échanges asynchrones   | `/` (UI 15672)             |
+| MinIO                | 9000 / 9001           | Go                           | Stockage objets S3                   | `/`                        |
+| Qdrant               | 6333                  | Rust                         | Base vecteurs pour RAG               | `/collections`             |
 
-    Client --> Traefik
-    Traefik --> Auth
-    Traefik --> Calendar
-    Traefik --> Chatbot
-    Traefik --> Cours
-    Traefik --> Files
-    Traefik --> Message
-    Traefik --> Notes
-    Traefik --> Notif
-    Traefik --> Support
-    Traefik --> User
+Chaque service expose également `/health`, `/metrics/<service>` pour le monitoring.
 
-    Auth --> Keycloak
-    Auth --> Cassandra
-    Calendar --> Cassandra
-    Chatbot --> Qdrant
-    Cours --> Cassandra
-    Cours --> MinIO
-    Files --> MinIO
-    Message --> RabbitMQ
-    Notes --> Cassandra
-    Notif --> RabbitMQ
-    Support --> Cassandra
-    User --> Cassandra
+## 3. Modèle de données
+
+1. **Cassandra – keyspace `ent_keyspace`** :
+   - `utilisateurs(id,…,role)`
+   - `cours`, `consultation_cours`
+   - `interactions_chatbot`
+   - `notifications`
+   - `calendar_events`
+   - `messages`
+   - `notes`
+   - `support_requests`
+2. **Postgres** : schéma interne Keycloak (utilisateurs, rôles, sessions).
+3. **Qdrant** : collection `documents` (vectors, payload).
+4. **MinIO** : bucket `cours` pour fichiers PDF/vidéos.
+
+## 4. Communications inter-services
+
+- **REST** synchrones via Traefik (port 80) : tous les appels `/api/<resource>`.
+- **RabbitMQ** : notifications, messagerie interne, files `emails`, `support`, etc.
+- **HTTP Streaming / WebSocket** (optionnel – non implémenté actuellement).
+
+```graph TD
+    frontend -- JWT --> traefik --> auth-service;
+    frontend --> traefik --> user-service;
+    notes-service -- REST --> notification-service;
+    notes-service -- gRPC? (non) --> cassandra;
+    chatbot-service -- Vector search --> qdrant;
+    service-cours -- Upload --> minio;
+    support-service -- AMQP --> rabbitmq;
 ```
 
-### Flux d'Authentification
+## 5. Frontend `Portail`
 
-```mermaid
-sequenceDiagram
-    participant U as Utilisateur
-    participant F as Frontend
-    participant T as Traefik
-    participant A as Auth Service
-    participant K as Keycloak
-    participant S as Services
+- **React (+ CRA & CRACO)**, Tailwind/Custom CSS.
+- Authentification : `keycloak-js`, stockage token en mémoire + refresh automatique.
+- Structure des pages :
+  1. `/login` – formulaire de connexion Keycloak.
+  2. `/portail` – tableau de bord : services disponibles.
+  3. `/cours` + `CoursModal` – liste & téléchargement des cours.
+  4. `/chat` (`GlobalChat`) – chatbot IA.
+  5. `/notes` – consultation des notes & formulaire enseignant.
+  6. `/calendar` – calendrier intégré.
+  7. `/messagerie` – messagerie interne.
+  8. `/support` – création tickets.
+  9. `/admin` – gestion utilisateurs (rôle `admin`).
 
-    U->>F: Accès application
-    F->>T: Requête
-    T->>A: Vérification Auth
-    A->>K: Validation Token
-    K-->>A: Token Validé
-    A-->>T: Auth OK
-    T->>S: Requête Service
-    S-->>T: Réponse
-    T-->>F: Données
-    F-->>U: Affichage
-```
+`PrivateRoute` et `AdminRoute` protègent les pages en fonction des rôles (`etudiant`, `enseignant`, `admin`).
 
-### Architecture Frontend
+## 6. Sécurité & authentification
 
-```mermaid
-graph LR
-    subgraph Frontend
-    React[React App]
-    Components[Components]
-    Routes[Routes]
-    Context[Context API]
-    end
+1. **Keycloak** gère : SSO, OAuth2/OIDC, rôles.
+2. Les microservices valident le token via JWKS (cache) et vérifient le rôle.
+3. Traefik peut être configuré avec HTTPS (certificats Let's Encrypt) ; ici, l'entrée `websecure` (:443) est prête.
+4. MinIO, RabbitMQ, Prom/Grafana accessibles uniquement via réseau interne `ent_network` (sauf ports UI mappés).
 
-    subgraph State
-    Auth[Auth Context]
-    Store[State Management]
-    end
+## 7. Routage Traefik
 
-    subgraph UI
-    Pages[Pages]
-    Forms[Forms]
-    Modals[Modals]
-    end
+- Détection automatique via labels Docker.
+- Entrypoints : `web` (:80) et `websecure` (:443).
+- Middlewares par défaut : `global-compress`, `security-headers`.
+- Règles :`PathPrefix(/api/<service>)` → service correspondant.
+- Tableau d'exemple :
+  - `/api/notes` → notes-service (port 8006).
+  - `/metrics/notes` → notes-service (port 8006) après `notes-metrics-strip`.
+- Dashboard accessible sous `/dashboard` (protégé à activer en prod).
+- Possibilité d'activer **Let's Encrypt** via `certificatesResolvers` pour HTTPS automatique.
 
-    React --> Components
-    React --> Routes
-    React --> Context
-    Components --> UI
-    Routes --> Pages
-    Context --> State
-```
+## 8. Observabilité
 
-### Technologies Principales
+- **Prometheus** scrape `:800X/metrics` + métriques Traefik.
+- **Grafana** importe automatiquement un dashboard `grafana/provisioning/dashboards/microservices.json` (latence, taux d'erreurs, CPU…).
+- Chaque service incrémente des counters via décorateur `@track_metrics`.
 
-- **Backend** : Python (FastAPI)
-  - Framework asynchrone haute performance
-  - Documentation OpenAPI automatique
-  - Validation des données avec Pydantic
-- **Frontend** : React.js
-  - Architecture basée sur les composants
-  - Gestion d'état avec Context API
-  - Routing avec React Router
-- **Base de données** :
-  - Cassandra
-    - Stockage distribué
-    - Haute disponibilité
-    - Modèle de données optimisé pour les écritures
-  - Qdrant
-    - Base de données vectorielle
-    - Recherche sémantique pour le chatbot
-    - Indexation efficace des documents
-- **Authentification** : Keycloak
-  - SSO (Single Sign-On)
-  - Gestion des rôles et permissions
-  - Protocoles : OAuth2, OpenID Connect
-- **Monitoring** :
-  - Prometheus
-    - Collecte de métriques
-    - Alerting configurable
-    - PromQL pour les requêtes
-  - Grafana
-    - Dashboards personnalisables
-    - Visualisation en temps réel
-    - Alerting multi-canal
+## 9. Déploiement & Exécution
 
-### Microservices
+1. `docker compose up -d --build` : construit images et crée réseau `ent_network`.
+2. **Healthchecks** : Cassandra, Keycloak, RabbitMQ, services FastAPI.
+3. **Init jobs** :
+   - `cassandra-init` exécute `init.cql`.
+   - `keycloak-init` configure realm / clients.
+4. **Volumes** : persistance données (`cassandra_data`, `postgres_data`, `minio_data`, `qdrant_data`, `ollama_data`).
+5. **Restart policy** : `unless-stopped` pour bases & chatbot, `on-failure` pour init jobs.
 
-#### 1. Service d'Authentification (`auth-service`)
+## 10. Répartition des responsabilités
 
-- Gestion de l'authentification et autorisation
-- Intégration avec Keycloak
-- Configuration sécurisée des tokens
+Auteurs non explicitement indiqués dans le dépôt. Ajouter ce tableau manuellement le cas échéant :
+| Domaine | Référent | Email |
+|---------|----------|-------|
+| Auth & Utilisateurs | – | – |
+| Cours & Fichiers | – | – |
+| IA / Chatbot | – | – |
 
-#### 2. Service de Calendrier (`calendar-service`)
+## 11. Plan de rapport technique complet
 
-- Gestion des emplois du temps
-- Planification des événements
-- API REST pour la gestion des calendriers
+1. Introduction & objectifs.
+2. Architecture globale (diagrammes, microservices).
+3. Sécurité & gouvernance des accès.
+4. Détails Backend : par service (code, schémas de BDD, tests).
+5. Détails Frontend : UX, flux d'auth, state management.
+6. Infrastructure : Traefik, Docker / CI, réseaux, déploiement.
+7. Observabilité & performances.
+8. Plan de montée en charge & scalabilité.
+9. Conclusion & perspectives (CI/CD, Kubernetes, IA générative…).
 
-#### 3. Service de Chatbot (`chatbot-service`)
+---
 
-- Assistant virtuel intelligent
-- Indexation automatique des contenus
-- Utilisation de Qdrant pour la recherche sémantique
-- Scripts d'automatisation pour l'indexation
-
-#### 4. Service de Cours (`service-cours`)
-
-- Gestion des cours et des ressources pédagogiques
-- Synchronisation des données
-- Intégration avec le stockage de fichiers
-
-#### 5. Service de Fichiers (`service-fichiers`)
-
-- Gestion du stockage de fichiers avec MinIO
-- Upload et download sécurisés
-- Gestion des permissions d'accès
-
-#### 6. Service de Messagerie (`massagerie-service`)
-
-- Système de messagerie interne
-- Notifications par email
-- Integration avec RabbitMQ
-
-#### 7. Service de Notes (`notes-service`)
-
-- Gestion des notes et évaluations
-- Stockage dans Cassandra
-- Métriques de performance
-
-#### 8. Service de Notifications (`notification-service`)
-
-- Notifications en temps réel
-- Consommateur RabbitMQ
-- Distribution des alertes
-
-#### 9. Service de Support (`support-service`)
-
-- Système de tickets de support
-- Suivi des demandes
-- Métriques de support
-
-#### 10. Service Utilisateurs (`user-service`)
-
-- Gestion des profils utilisateurs
-- Synchronisation des données
-- Intégration avec l'authentification
-
-### Frontend (`Frontend/Portail`)
-
-- Interface utilisateur moderne en React
-- Composants réutilisables
-- Intégration avec Keycloak
-- Design responsive
-- Fonctionnalités principales :
-  - Tableau de bord
-  - Calendrier
-  - Messagerie
-  - Chat
-  - Gestion des cours
-  - Gestion des notes
-  - Profil utilisateur
-  - Interface d'administration
-
-### Monitoring et Observabilité
-
-- **Prometheus** : Collecte de métriques
-- **Grafana** : Tableaux de bord de monitoring
-- **Traefik** : Logs d'accès et métriques
-
-## Configuration et Déploiement
-
-### Variables d'Environnement Clés
-
-```env
-# Keycloak
-KEYCLOAK_URL=http://keycloak:8080
-KEYCLOAK_REALM=ent
-KEYCLOAK_CLIENT_ID=ent-client
-
-# Cassandra
-CASSANDRA_HOSTS=cassandra
-CASSANDRA_KEYSPACE=ent
-CASSANDRA_REPLICATION_FACTOR=3
-
-# MinIO
-MINIO_ROOT_USER=admin
-MINIO_ROOT_PASSWORD=password
-MINIO_ENDPOINT=minio:9000
-
-# RabbitMQ
-RABBITMQ_HOST=rabbitmq
-RABBITMQ_USER=user
-RABBITMQ_PASSWORD=password
-```
-
-### Déploiement avec Docker Compose
-
-1. **Préparation**
-
-```bash
-# Création des volumes
-docker volume create cassandra_data
-docker volume create minio_data
-docker volume create keycloak_data
-
-# Configuration du réseau
-docker network create ent_network
-```
-
-2. **Démarrage des Services**
-
-```bash
-# Démarrage de l'infrastructure
-docker-compose up -d cassandra minio rabbitmq keycloak
-
-# Attente de l'initialisation
-sleep 30
-
-# Démarrage des services applicatifs
-docker-compose up -d
-```
-
-### Scripts d'Initialisation
-
-- `init-all.sh` : Configuration complète
-- `init-keycloak.sh` : Configuration Keycloak
-- `init.cql` : Schéma Cassandra
-
-## Sécurité
-
-- Authentification centralisée avec Keycloak
-- Communication sécurisée entre les services
-- Gestion des tokens JWT
-- Middlewares de sécurité Traefik
-- Isolation des services via Docker
-
-## Maintenance et Monitoring
-
-- Dashboards Grafana préconfigurés
-- Alerting Prometheus
-- Logs centralisés
-- Métriques de performance par service
-
-## Documentation Technique
-
-Chaque service contient sa propre documentation et ses requirements spécifiques dans son répertoire.
-
-## Documentation API
-
-Chaque service expose sa documentation OpenAPI accessible via :
-
-```
-http://<service>:<port>/docs
-```
-
-## Contribution
-
-1. Fork du projet
-2. Création de branche (`git checkout -b feature/AmazingFeature`)
-3. Commit (`git commit -m 'Add AmazingFeature'`)
-4. Push (`git push origin feature/AmazingFeature`)
-5. Pull Request
+_Document généré automatiquement – mise à jour recommandée après chaque évolution majeure._
